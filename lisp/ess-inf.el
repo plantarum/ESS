@@ -405,36 +405,46 @@ Abbreviation performed by `abbreviate-file-name'.
   "Internal function to set the satus of the PROC
 If no-timestamp, don't set the last-eval timestamp.
 Return the 'busy state."
+  ;; also does callbacks ... a bit of a kludge
   ;; todo: do it in one search, use starting position, use prog1
-  (let ((busy (not (string-match (concat "\\(" inferior-ess-primary-prompt "\\)\\'") string))))
-    (process-put proc 'busy-end? (and (not busy)
-                                      (process-get proc 'busy)))
-    (if (not busy) (process-put proc 'running-async? nil))
+  (let ((busy (not (string-match (concat "\\(" inferior-ess-primary-prompt "\\)\\'") string)))
+        (sec-prompt (and inferior-ess-secondary-prompt
+                         (string-match (concat "\\(" inferior-ess-secondary-prompt "\\)\\'") string))))
+    ;; (when sec-prompt
+    ;;   (inferior-ess-run-secondary-callbacks proc))
+    (if (not busy)
+        (process-put proc 'running-async? nil))
     (process-put proc 'busy busy)
-    (process-put proc 'sec-prompt
-                 (when inferior-ess-secondary-prompt
-                   (string-match (concat "\\(" inferior-ess-secondary-prompt "\\)\\'") string)))
+    (process-put proc 'sec-prompt sec-prompt)
     (unless no-timestamp
       (process-put proc 'last-eval (current-time)))
-    busy
-    ))
+    busy))
 
 (defun inferior-ess-mark-as-busy (proc)
   (process-put proc 'busy t)
   (process-put proc 'sec-prompt nil))
 
-(defun inferior-ess-run-callback (proc)
-  (when (process-get proc 'busy-end?)
-    (let ((cb (car (process-get proc 'callbacks))))
-      (when cb
-        (if ess-verbose
-            (ess-write-to-dribble-buffer "executing callback ...\n")
-          (process-put proc 'suppress-next-output? t))
-        (process-put proc 'callbacks nil)
-        (condition-case err
-            (funcall cb proc)
-          (error (message "%s" (error-message-string err))))
-        ))))
+(defun inferior-ess-run-primary-callbacks (proc)
+  (let ((cb (car (process-get proc 'primary-callbacks))))
+    (when cb
+      (if ess-verbose
+          (ess-write-to-dribble-buffer "executing callback ...\n")
+        (process-put proc 'suppress-next-output? t))
+      (process-put proc 'primary-callbacks nil)
+      (condition-case err
+          (funcall cb proc)
+        (error (message "%s" (error-message-string err)))))))
+
+(defun inferior-ess-run-secondary-callbacks (proc)
+  (let ((cb (car (process-get proc 'secondary-callbacks))))
+    (when cb
+      (if ess-verbose
+          (ess-write-to-dribble-buffer "executing secondary callback ...\n"))
+      (process-put proc 'secondary-callbacks nil)
+      (condition-case err
+          (funcall cb proc)
+        (error (message "%s" (error-message-string err)))))))
+
 
 (defun ess--if-verbose-write-process-state (proc string &optional filter)
   (ess-if-verbose-write
@@ -464,13 +474,17 @@ the rest to `comint-output-filter'.
 Taken from octave-mod.el."
   (inferior-ess-set-status proc string)
   (ess--if-verbose-write-process-state proc string)
-  (inferior-ess-run-callback proc) ;; protected
   (if (process-get proc 'suppress-next-output?)
-      ;; works only for surpressing short output, for time being is enough (for callbacks)
+      ;; Works only for surpressing short output,
+      ;; For time being this is enough (for callbacks)
       (process-put proc 'suppress-next-output? nil)
     (comint-output-filter proc (inferior-ess-strip-ctrl-g string))
-    (ess--show-process-buffer-on-error string proc)
-    ))
+    (when (process-get proc 'sec-prompt)
+      (inferior-ess-run-secondary-callbacks proc))
+    (when (not (process-get proc 'busy))
+      (inferior-ess-run-primary-callbacks proc)
+      (inferior-ess-run-secondary-callbacks proc))
+    (ess--show-process-buffer-on-error string proc)))
 
 
 (defun ess--show-process-buffer-on-error (string proc)
@@ -1182,10 +1196,8 @@ STRING.
                 (setq functions (cdr functions))))
           (setq string (funcall (car functions) string)))
         (setq functions (cdr functions)))
-
       (with-current-buffer pbuf
         (run-hook-with-args 'comint-input-filter-functions string))
-
       string)))
 
 (defun ess--concat-new-line-maybe (string)
@@ -1534,40 +1546,71 @@ TEXT.
         (goto-char (marker-position (process-mark sprocess)))
         (if (stringp invisibly)
             (insert-before-markers (concat "*** " invisibly " ***\n")))
-        ;; dbg:
-        ;; dbg (ess-write-to-dribble-buffer
-        ;; dbg  (format "(eval-visibly 2): text[%d]= '%s'\n" (length text) text))
-        (while (or (setq txt-gt-0 (> (length text) 0))
-                   even-empty)
-          (setq even-empty nil)
-          (if txt-gt-0
-              (progn
-                (setq pos (string-match "\n\\|$" text))
-                (setq com (concat (substring text 0 pos) "\n"))
-                (setq text (substring text (min (length text) (1+ pos)))))
-            ;; else 0-length text
-            (setq com "\n"))
-          (goto-char (marker-position (process-mark sprocess)))
-          (if win (set-window-point win (process-mark sprocess)))
-          (when (not invisibly)
-            (insert (propertize com 'font-lock-face 'comint-highlight-input)) ;; for consistency with comint :(
-            (set-marker (process-mark sprocess) (point)))
-          (inferior-ess-mark-as-busy sprocess)
-          (process-send-string sprocess com)
-          (when (or wait-last-prompt
-                    (> (length text) 0))
-            (ess-wait-for-process sprocess t wait-sec))
-          )
-        (if eob (ess-show-buffer (buffer-name sbuffer) nil))
-        (goto-char (marker-position (process-mark sprocess)))
-        (when win
-          (with-selected-window win
-            (goto-char (point))
-            (recenter (- -1 scroll-margin))) ;; this recenter is crucial to avoid reseting window-point
-          )))
+        (if eob
+            (ess-show-buffer (buffer-name sbuffer) nil))
+        (ess--send-string-linewise text sprocess)
+        ))))
+        ;; (while (or (setq txt-gt-0 (> (length text) 0))
+        ;;            even-empty)
+        ;;   (setq even-empty nil)
+        ;;   (if txt-gt-0
+        ;;       (progn
+        ;;         (setq pos (string-match "\n\\|$" text))
+        ;;         (setq com (concat (substring text 0 pos) "\n"))
+        ;;         (setq text (substring text (min (length text) (1+ pos)))))
+        ;;     ;; else 0-length text
+        ;;     (setq com "\n"))
+        ;;   (goto-char (marker-position (process-mark sprocess)))
+        ;;   (if win (set-window-point win (process-mark sprocess)))
+        ;;   (when (not invisibly)
+        ;;     (insert (propertize com 'font-lock-face 'comint-highlight-input)) ;; for consistency with comint :(
+        ;;     (set-marker (process-mark sprocess) (point)))
+        ;;   (inferior-ess-mark-as-busy sprocess)
+        ;;   (process-send-string sprocess com)
+        ;;   (when (or wait-last-prompt
+        ;;             (> (length text) 0))
+        ;;     (ess-wait-for-process sprocess t wait-sec)))
+        ;; (if eob
+        ;;     (ess-show-buffer (buffer-name sbuffer) nil))
+        ;; (goto-char (marker-position (process-mark sprocess)))
+        ;; (when win
+        ;;   (with-selected-window win
+        ;;     (goto-char (point))
+        ;;     (recenter (- -1 scroll-margin))) ;; this recenter is crucial to avoid reseting window-point
+        ;;   )))
 
-    (if (numberp sleep-sec)
-        (sleep-for sleep-sec)))); in addition to timeout-ms
+    ;; (if (numberp sleep-sec)
+    ;;     (sleep-for sleep-sec)))); in addition to timeout-ms
+
+
+(defun ess--send-string-linewise (string proc)
+  (let* ((redisplay-dont-pause nil)
+         (buff (process-buffer proc))
+         (win (get-buffer-window buff t))
+         (pos (string-match "\n\\|$" string))
+         (com (concat (substring string 0 pos) "\n"))
+         (string (substring string (min (length string) (1+ pos)))))
+    (with-current-buffer buff
+      (goto-char (marker-position (process-mark proc)))
+      (if win
+          (set-window-point win (process-mark proc))) ;? necessary?
+      (insert (propertize com 'font-lock-face 'comint-highlight-input)) ;; for consistency with comint :(
+      (set-marker (process-mark proc) (point))
+      (inferior-ess-mark-as-busy proc)
+      (when (> (length string) 0)
+        (process-put proc 'secondary-callbacks
+                     (list `(lambda (proc)
+                              (ess--send-string-linewise
+                               ,string ,proc))))
+        (process-put proc 'interruptable? nil))
+      (process-send-string proc com)
+      ;; (goto-char (marker-position (process-mark proc)))
+      (when (and win
+                 (not (process-get proc 'busy)))
+        (with-selected-window win
+          (goto-char (point))
+          (recenter (- -1 scroll-margin))) ;; this recenter is crucial to avoid reseting window-point
+        ))))
 
 
 ;; VS[06-01-2013]: this how far I got in investingating the emacs reseting of
