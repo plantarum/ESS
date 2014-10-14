@@ -1,7 +1,12 @@
+README
+ANNOUNCE
 *~
 *.orig
 *#
 *.info
+lisp/dist
+etc/SVN-REVISION-tmp
+doc/html
 doc/ess.*
 doc/info/ess.info
 doc/readme.*
